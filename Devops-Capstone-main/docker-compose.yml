@@ -1,0 +1,89 @@
+version: "3.9"
+
+services:
+
+  # ── Database ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: marketly
+      POSTGRES_PASSWORD: marketly_dev
+      POSTGRES_MULTIPLE_DATABASES: auth_db,catalog_db,orders_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/create-multiple-dbs.sh:/docker-entrypoint-initdb.d/create-multiple-dbs.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marketly"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  auth-service:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    ports:
+      - "5001:5001"
+    environment:
+      DATABASE_URL: "postgresql://marketly:marketly_dev@postgres:5432/auth_db"
+      SHARED_SECRET: "dev-shared-secret-change-me"
+      CORS_ALLOWED_ORIGIN: "http://localhost:5173"
+      COOKIE_SECURE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  catalog-service:
+    build:
+      context: ./services/catalog-service
+      dockerfile: Dockerfile
+    ports:
+      - "5002:5002"
+    environment:
+      DATABASE_URL: "postgresql://marketly:marketly_dev@postgres:5432/catalog_db"
+      SHARED_SECRET: "dev-shared-secret-change-me"
+      CORS_ALLOWED_ORIGIN: "http://localhost:5173"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  orders-service:
+    build:
+      context: ./services/orders-service
+      dockerfile: Dockerfile
+    ports:
+      - "5003:5003"
+    environment:
+      DATABASE_URL: "postgresql://marketly:marketly_dev@postgres:5432/orders_db"
+      SHARED_SECRET: "dev-shared-secret-change-me"
+      CORS_ALLOWED_ORIGIN: "http://localhost:5173"
+      CATALOG_SERVICE_URL: "http://catalog-service:5002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      catalog-service:
+        condition: service_started
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_AUTH_URL: "http://localhost:5001"
+        VITE_CATALOG_URL: "http://localhost:5002"
+        VITE_ORDERS_URL: "http://localhost:5003"
+    ports:
+      - "5173:80"
+    depends_on:
+      - auth-service
+      - catalog-service
+      - orders-service
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
