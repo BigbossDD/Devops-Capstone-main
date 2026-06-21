@@ -1,0 +1,77 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: marketly-ingress
+  namespace: marketly
+  annotations:
+    # Traefik is bundled with k3s — these annotations control its behaviour
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    # Strip /api/auth prefix before forwarding to auth-service
+    # (the service expects /api/auth/... so we do NOT strip here — just route)
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          # Frontend — catch-all, must be last
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+
+          # Auth service
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  number: 5001
+
+          # Catalog service
+          - path: /api/products
+            pathType: Prefix
+            backend:
+              service:
+                name: catalog-service
+                port:
+                  number: 5002
+
+          - path: /api/categories
+            pathType: Prefix
+            backend:
+              service:
+                name: catalog-service
+                port:
+                  number: 5002
+
+          # Orders service
+          - path: /api/orders
+            pathType: Prefix
+            backend:
+              service:
+                name: orders-service
+                port:
+                  number: 5003
+---
+# Traefik NodePort service — this is the port the ALB target group points at.
+# k3s ships Traefik already deployed; we just expose it on a fixed NodePort
+# so the ALB can reach it on every node.
+# NodePort 30080 must match var.traefik_nodeport in modules/alb/variables.tf
+apiVersion: v1
+kind: Service
+metadata:
+  name: traefik-nodeport
+  namespace: kube-system
+spec:
+  selector:
+    app.kubernetes.io/name: traefik
+  type: NodePort
+  ports:
+    - name: web
+      port: 80
+      targetPort: web
+      nodePort: 30080   # ALB target group points here

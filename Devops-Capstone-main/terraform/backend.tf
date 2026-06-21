@@ -7,7 +7,7 @@ terraform {
   backend "s3" {
     bucket         = "marketly-terraform-state"      # change to your bucket name
     key            = "capstone/terraform.tfstate"
-    region         = "us-east-1"                     # change to your region
+    region         = "us-east-1"                  
     dynamodb_table = "marketly-terraform-locks"      # change to your table name
     encrypt        = true
   }

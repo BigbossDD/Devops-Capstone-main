@@ -1,0 +1,133 @@
+name: CD — Deploy to k3s
+
+on:
+  # Trigger after CI completes successfully on main
+  workflow_run:
+    workflows: ["CI — Build & Push Images"]
+    types: [completed]
+    branches: [main]
+  # Also allow manual deploys from the Actions tab
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (default: latest)"
+        required: false
+        default: "latest"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to k3s cluster
+    # CRITICAL: runs-on must match the label you gave the runner when you
+    # registered it on the control-plane instance. See setup instructions below.
+    runs-on: self-hosted
+
+    # Don't deploy if CI failed
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    env:
+      AWS_REGION: us-east-1
+      NAMESPACE: marketly
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Resolve the image tag: use the short SHA from the triggering CI run,
+      # or the manually-specified tag, or fall back to latest.
+      - name: Set image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+          elif [ -n "${{ github.event.workflow_run.head_sha }}" ]; then
+            SHA="${{ github.event.workflow_run.head_sha }}"
+            echo "tag=${SHA::8}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=latest" >> $GITHUB_OUTPUT
+          fi
+
+      # The self-hosted runner lives inside the VPC on the control-plane
+      # instance. k3s writes its kubeconfig to /etc/rancher/k3s/k3s.yaml.
+      # We set KUBECONFIG so kubectl finds it without sudo.
+      - name: Set KUBECONFIG
+        run: echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> $GITHUB_ENV
+
+      - name: Verify cluster is reachable
+        run: kubectl get nodes
+
+      # Update each deployment's image to the new tag.
+      # kubectl set image is safer than kubectl apply for image-only updates
+      # because it only touches the image field, not the whole spec.
+      - name: Deploy auth-service
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          kubectl set image deployment/auth-service \
+            auth-service=$ECR_REGISTRY/marketly/auth-service:$IMAGE_TAG \
+            -n $NAMESPACE
+
+      - name: Deploy catalog-service
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          kubectl set image deployment/catalog-service \
+            catalog-service=$ECR_REGISTRY/marketly/catalog-service:$IMAGE_TAG \
+            -n $NAMESPACE
+
+      - name: Deploy orders-service
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          kubectl set image deployment/orders-service \
+            orders-service=$ECR_REGISTRY/marketly/orders-service:$IMAGE_TAG \
+            -n $NAMESPACE
+
+      - name: Deploy frontend
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          kubectl set image deployment/frontend \
+            frontend=$ECR_REGISTRY/marketly/frontend:$IMAGE_TAG \
+            -n $NAMESPACE
+
+      # Wait for all 4 deployments to finish rolling out before declaring
+      # success. If a pod crashes, this step fails and the job is marked red.
+      - name: Wait for rollouts
+        run: |
+          kubectl rollout status deployment/auth-service    -n $NAMESPACE --timeout=120s
+          kubectl rollout status deployment/catalog-service -n $NAMESPACE --timeout=120s
+          kubectl rollout status deployment/orders-service  -n $NAMESPACE --timeout=120s
+          kubectl rollout status deployment/frontend        -n $NAMESPACE --timeout=120s
+
+      # Quick smoke test — hit /health on each backend service via port-forward.
+      # Runs inside the cluster so it works even before the ALB is healthy.
+      - name: Smoke test — health endpoints
+        run: |
+          for svc in auth-service:5001 catalog-service:5002 orders-service:5003; do
+            NAME=$(echo $svc | cut -d: -f1)
+            PORT=$(echo $svc | cut -d: -f2)
+            kubectl port-forward svc/$NAME $PORT:$PORT -n $NAMESPACE &
+            PF_PID=$!
+            sleep 3
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$PORT/health)
+            kill $PF_PID 2>/dev/null || true
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "FAIL: $NAME /health returned $HTTP_STATUS"
+              exit 1
+            fi
+            echo "OK: $NAME /health → $HTTP_STATUS"
+          done
+
+      - name: Deployment summary
+        run: |
+          echo "=== Deployed image tag: ${{ steps.tag.outputs.tag }} ==="
+          kubectl get pods -n $NAMESPACE
